@@ -3,101 +3,128 @@ name: Build and push Docker image
 on:
   push:
     branches:
-      - master
+    - master
+  pull_request:
   schedule:
     - cron: '0 2 * * 0'
   workflow_dispatch:
-
-concurrency:
-  group: docker-build-${{ github.ref }}
-  cancel-in-progress: true
-
-permissions:
-  contents: read
-  packages: write
 
 env:
   CI: true
   DOCKER_BUILDKIT: 1
 
 jobs:
-  build-and-push:
-    # Run only for real pushes to the default branch (no PRs)
-    if: github.ref == 'refs/heads/master' && github.event_name != 'pull_request'
-    runs-on: ubuntu-24.04
+  generate:
     strategy:
       matrix:
-        # we only need to vary the package manager; buildx will handle platforms
-        package-manager: [apt, pacman]
-        
+        include:
+          - runner: ubuntu-24.04
+            architecture: i686
+            package-manager: apt
+          - runner: ubuntu-24.04
+            architecture: x86_64
+            package-manager: apt
+          - runner: ubuntu-24.04-arm
+            architecture: arm
+            package-manager: apt
+          - runner: ubuntu-24.04-arm
+            architecture: aarch64
+            package-manager: apt
+          - runner: ubuntu-24.04
+            architecture: i686
+            package-manager: pacman
+          - runner: ubuntu-24.04
+            architecture: x86_64
+            package-manager: pacman
+          - runner: ubuntu-24.04-arm
+            architecture: arm
+            package-manager: pacman
+          - runner: ubuntu-24.04-arm
+            architecture: aarch64
+            package-manager: pacman
+    runs-on: ${{ matrix.runner }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Set image name
-        run: |
-          if [ "${{ matrix.package-manager }}" = "apt" ]; then
-            echo "IMAGE_NAME=termux/termux-docker" >> $GITHUB_ENV
-          else
-            echo "IMAGE_NAME=termux/termux-docker-pacman" >> $GITHUB_ENV
-          fi
+    - name: Set variables
+      run: |
+        echo "TERMUX_ARCH=${{ matrix.architecture }}" >> $GITHUB_ENV
+        echo "TERMUX_PACKAGE_MANAGER=${{ matrix.package-manager }}" >> $GITHUB_ENV
+        if [ ${{ matrix.package-manager }} = apt ]; then
+          echo "TERMUX_DOCKER__IMAGE_NAME=termux/termux-docker" >> $GITHUB_ENV
+        elif [ ${{ matrix.package-manager }} = pacman ]; then
+          echo "TERMUX_DOCKER__IMAGE_NAME=termux/termux-docker-pacman" >> $GITHUB_ENV
+        fi
 
-      - name: (Optional) Generate build context
-        # If your repo requires a generation step (your original ./generate.sh),
-        # keep and adapt this. If you already have Dockerfiles in-tree for buildx,
-        # you can remove this step.
-        run: |
-          chmod +x ./generate.sh || true
-          ./generate.sh
+    - name: Clone repository
+      uses: actions/checkout@v4
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v2
+    - name: Build image
+      run: ./generate.sh
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
+    - name: Login to Docker Hub
+      if: github.ref == 'refs/heads/master' && github.event_name != 'pull_request' && github.repository == 'termux/termux-docker'
+      uses: docker/login-action@v4
+      with:
+        username: grimler
+        password: ${{ secrets.GRIMLER_DOCKER_TOKEN }}
 
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+    - name: Push to Docker Hub
+      if: github.ref == 'refs/heads/master' && github.event_name != 'pull_request' && github.repository == 'termux/termux-docker'
+      run: docker push ${{ env.TERMUX_DOCKER__IMAGE_NAME }}:${{ env.TERMUX_ARCH }}
 
-      - name: Build and push multi-arch image
-        uses: docker/build-push-action@4
-        with:
-          context: 
-          platforms: linux/386,linux/amd64,linux/arm/v7,linux/arm64
-          push: true
-          tags: |
-             ${{ env.IMAGE_NAME }}:latest
-             ${{ env.IMAGE_NAME }}:${{ matrix.package-manager }}
-          build-args: |
-            TERMUX_PACKAGE_MANAGER=${{ matrix.package-manager }}
-      
-      - name: Export single-arch tar archives (optional, only if you need them)
-        if: always()
-        run: |
-          # Export each arch-specific image (this requires images tagged per-arch).
-          # If build-push-action pushed multi-arch manifests only, typical image pull will get the matching arch.
-          # Example: pull the specific arch using --platform if needed
-          ARCHS="386 amd64 arm v7 aarch64"
-          for A in 386 amd64 arm v7 aarch64; do
-          # map to platform name used in your old naming scheme
-          TAG="${{ env.IMAGE_NAME }}:${A}"
-          # try to pull platform-specific image (may fail if not available); continue on error
-          docker pull --platform "linux/$([ \"$A\" = \"386\" ] && echo \"386\" || if [ \"$A\" = \"aarch64\" ]; then echo \"arm64\"; elif [ \"$A\" = \"arm\" -o \"$A\" = \"v7\" ]; then echo \"arm/v7\"; else echo \"$A\"; fi )" "${TAG}" || true
-          OUT="termux-docker-${{ matrix.package-manager }}-${A}.tar"
-          docker save -o "${OUT}" "${TAG}" || continue
-          sha256sum "${OUT}" || true
-          echo "${OUT}"
-          done
-          
-      - name: Upload artifact (archives)
-        if: always()
-        uses: actions/upload-artifact@v5
-        with:
-          name: termux-docker-${{ matrix.package-manager }}-${{ github.sha }}
-          path: termux-docker-${{ matrix.package-manager }}-*.tar
+    - name: Export container as tar archive
+      if: always()
+      run: |
+        docker run \
+          --name termux-docker-${{ env.TERMUX_PACKAGE_MANAGER }}-${{ env.TERMUX_ARCH }} \
+          ${{ env.TERMUX_DOCKER__IMAGE_NAME }}:${{ env.TERMUX_ARCH }} \
+          uname -a
+        docker stop termux-docker-${{ env.TERMUX_PACKAGE_MANAGER }}-${{ env.TERMUX_ARCH }}
+        docker export -o termux-docker-${{ env.TERMUX_PACKAGE_MANAGER }}-${{ env.TERMUX_ARCH }}.tar \
+          termux-docker-${{ env.TERMUX_PACKAGE_MANAGER }}-${{ env.TERMUX_ARCH }}
+        sha256sum termux-docker-${{ env.TERMUX_PACKAGE_MANAGER }}-${{ env.TERMUX_ARCH }}.tar
+
+    - name: Store tar archive
+      if: always()
+      uses: actions/upload-artifact@v5
+      with:
+        name: termux-docker-${{ env.TERMUX_PACKAGE_MANAGER }}-${{ env.TERMUX_ARCH }}-${{ github.sha }}
+        path: termux-docker-${{ env.TERMUX_PACKAGE_MANAGER }}-${{ env.TERMUX_ARCH }}.tar
+
+  multiplatform:
+    strategy:
+      matrix:
+        include:
+          - package-manager: apt
+          - package-manager: pacman
+    if: github.ref == 'refs/heads/master' && github.event_name != 'pull_request' && github.repository == 'termux/termux-docker'
+    needs: generate
+    runs-on: ubuntu-24.04
+    steps:
+
+    - name: Set variables
+      run: |
+        if [ ${{ matrix.package-manager }} = apt ]; then
+          echo "TERMUX_DOCKER__IMAGE_NAME=termux/termux-docker" >> $GITHUB_ENV
+        elif [ ${{ matrix.package-manager }} = pacman ]; then
+          echo "TERMUX_DOCKER__IMAGE_NAME=termux/termux-docker-pacman" >> $GITHUB_ENV
+        fi
+
+    - name: Login to Docker Hub
+      uses: docker/login-action@v4
+      with:
+        username: grimler
+        password: ${{ secrets.GRIMLER_DOCKER_TOKEN }}
+
+    - name: Create multiplatform tag
+      run: |
+        docker manifest create \
+          ${{ env.TERMUX_DOCKER__IMAGE_NAME }}:latest \
+          ${{ env.TERMUX_DOCKER__IMAGE_NAME }}:i686 \
+          ${{ env.TERMUX_DOCKER__IMAGE_NAME }}:x86_64 \
+          ${{ env.TERMUX_DOCKER__IMAGE_NAME }}:arm \
+          ${{ env.TERMUX_DOCKER__IMAGE_NAME }}:aarch64
+
+    - name: Push multiplatform tag to Docker Hub
+      run: docker manifest push ${{ env.TERMUX_DOCKER__IMAGE_NAME }}:latest
           
